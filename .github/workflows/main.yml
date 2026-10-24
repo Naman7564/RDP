@@ -7,6 +7,9 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
+    permissions:
+      contents: read
+      statuses: write
 
     steps:
       - name: Configure Core RDP Settings
@@ -67,19 +70,65 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $stdout = "$env:RUNNER_TEMP\ts-up.out"
+          $stderr = "$env:RUNNER_TEMP\ts-up.err"
+
+          # Start `tailscale up` in the background so the interactive login URL
+          # can be published while the command is still waiting for approval.
+          $tsArgs = @("up", "--hostname=gh-runner-$env:GITHUB_RUN_ID")
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if ($authKey) { $tsArgs += "--authkey=$authKey" }
+
+          $proc = Start-Process -FilePath $tsExe -ArgumentList $tsArgs `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
+              -PassThru -NoNewWindow
+
+          $loginUrl = $null
+          for ($i = 0; $i -lt 150; $i++) {
+              Start-Sleep -Seconds 2
+              $text = @()
+              if (Test-Path $stdout) { $text += Get-Content $stdout -Raw -ErrorAction SilentlyContinue }
+              if (Test-Path $stderr) { $text += Get-Content $stderr -Raw -ErrorAction SilentlyContinue }
+              if (($text -join "`n") -match 'https://login\.tailscale\.com/a/[A-Za-z0-9]+') {
+                  $loginUrl = $Matches[0]
+                  break
+              }
+              if ($proc.HasExited) { break }
+          }
+
+          # Publish the one-time login URL as a commit status so the local
+          # script can show it without access to the live job log.
+          if ($loginUrl) {
+              Write-Host "Login URL: $loginUrl"
+              gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
+                  -f state=pending -f context="rdp-login-$env:GITHUB_RUN_ID" `
+                  -f description="LOGIN: $loginUrl" | Out-Null
+          }
+
+          $proc.WaitForExit()
+          if ($proc.ExitCode -ne 0) {
+              if (Test-Path $stderr) { Get-Content $stderr }
+              Write-Error "tailscale up failed with exit code $($proc.ExitCode)"
+              exit 1
+          }
+
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
+              -f state=success -f context="rdp-login-$env:GITHUB_RUN_ID" `
+              -f description="Tailscale connected" | Out-Null
+
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+              $tsIP = & $tsExe ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
               $retries++
           }
-          
+
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
@@ -99,15 +148,26 @@ jobs:
           Write-Host "TCP connectivity successful!"
 
       - name: Maintain Connection
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $password = ($env:RDP_CREDS -split 'Password: ')[-1]
+
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: $password"
           Write-Host "==================`n"
-          
+
+          # Publish the credentials as a commit status so the local script can
+          # read them while the job is still running.
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
+              -f state=success -f context="rdp-creds-$env:GITHUB_RUN_ID" `
+              -f description="IP $env:TAILSCALE_IP | RDP | $password" | Out-Null
+
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
+
